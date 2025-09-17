@@ -17,7 +17,6 @@ from huggingface_hub import snapshot_download
 from huggingface_hub.errors import RepositoryNotFoundError
 from mlx.utils import tree_flatten, tree_unflatten
 from mlx_vlm.utils import process_image
-from transformers import AutoProcessor, PreTrainedTokenizer
 
 from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 
@@ -221,16 +220,19 @@ def load_model(
 
 def load(
     path_or_hf_repo: str,
+    tokenizer_path: Optional[str] = None,
     tokenizer_config={},
     model_config={},
     adapter_path: Optional[str] = None,
     lazy: bool = False,
 ) -> Tuple[nn.Module, TokenizerWrapper]:
     """
-    Load the model and tokenizer from a given path or a huggingface repository.
+    Load the model and tokenizer from given paths.
 
     Args:
-        path_or_hf_repo (Path): The path or the huggingface repository to load the model from.
+        path_or_hf_repo (str): The path or the huggingface repository to load the model from.
+        tokenizer_path (str, optional): Path to the tokenizer file or directory. If None, 
+            defaults to the model path.
         tokenizer_config (dict, optional): Configuration parameters specifically for the tokenizer.
             Defaults to an empty dictionary.
         model_config(dict, optional): Configuration parameters specifically for the model.
@@ -251,30 +253,18 @@ def load(
 
     model = load_model(model_path, lazy, model_config, path_to_repo=path_or_hf_repo)
 
-    # Try to load tokenizer first, then fall back to processor if needed
-    tokenizer = None
+    # Use provided tokenizer path or default to model path
+    if tokenizer_path is None:
+        tokenizer_path = model_path
 
-    # First attempt: load tokenizer
     try:
-        if hasattr(model.config, "vision_config"):
-            tokenizer = AutoProcessor.from_pretrained(model_path)
-        else:
-            tokenizer = load_tokenizer(model_path, tokenizer_config)
+        tokenizer = load_tokenizer(tokenizer_path, tokenizer_config)
     except Exception as tokenizer_error:
         raise ValueError(
-            f"Failed to initialize tokenizer or processor: {tokenizer_error}"
+            f"Failed to initialize tokenizer: {tokenizer_error}"
         ) from tokenizer_error
 
     return model, tokenizer
-
-
-def fetch_from_hub(
-    model_path: Path, lazy: bool = False, **kwargs
-) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
-    model = load_model(model_path, lazy, **kwargs)
-    config = load_config(model_path)
-    tokenizer = load_tokenizer(model_path)
-    return model, config, tokenizer
 
 
 def make_shards(weights: dict, max_file_size_gb: int = MAX_FILE_SIZE_GB) -> list:
@@ -597,9 +587,9 @@ def convert(
 ):
     print("[INFO] Loading")
     model_path = get_model_path(hf_path, revision=revision)
-    model, config, tokenizer = fetch_from_hub(
-        model_path, lazy=True, path_to_repo=hf_path
-    )
+    model = load_model(model_path, lazy=True, path_to_repo=hf_path)
+    config = load_config(model_path)
+    tokenizer = load_tokenizer(model_path)
 
     weights = dict(tree_flatten(model.parameters()))
     dtype = getattr(mx, dtype)
@@ -632,7 +622,10 @@ def convert(
         for file in files:
             shutil.copy(file, mlx_path)
 
-    tokenizer.save_pretrained(mlx_path)
+    # Save tokenizer using tokenizers library method
+    # The tokenizer.json file is already copied above, but we ensure it's saved properly
+    tokenizer_path = mlx_path / "tokenizer.json"
+    tokenizer._tokenizer.save(str(tokenizer_path))
 
     save_config(config, config_path=mlx_path / "config.json")
 
@@ -684,7 +677,7 @@ def prepare_inputs(
 
 def generate(
     model: nn.Module,
-    processor: Union[PreTrainedTokenizer, TokenizerWrapper, AutoProcessor],
+    processor: TokenizerWrapper,
     texts: Union[str, List[str]],
     images: Union[str, mx.array, List[str], List[mx.array]] = None,
     max_length: int = 512,

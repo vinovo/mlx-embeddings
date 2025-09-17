@@ -1,7 +1,7 @@
 import json
 from functools import partial
 
-from transformers import AutoTokenizer
+from tokenizers import Tokenizer
 
 REPLACEMENT_CHAR = "\ufffd"
 
@@ -303,28 +303,35 @@ def _is_bpe_decoder(decoder):
     return _match(_target_description, decoder)
 
 
-def load_tokenizer(model_path, tokenizer_config_extra={}):
-    """Load a huggingface tokenizer and try to infer the type of streaming
+def load_tokenizer(tokenizer_path, tokenizer_config_extra={}):
+    """Load a tokenizer from a local file path and try to infer the type of streaming
     detokenizer to use.
 
-    Note, to use a fast streaming tokenizer, pass a local file path rather than
-    a Hugging Face repo ID.
+    Args:
+        tokenizer_path: Path to the tokenizer.json file or directory containing it
+        tokenizer_config_extra: Additional config parameters (kept for compatibility)
     """
     detokenizer_class = NaiveStreamingDetokenizer
 
-    tokenizer_file = model_path / "tokenizer.json"
-    if tokenizer_file.exists():
-        with open(tokenizer_file, "r") as fid:
-            tokenizer_content = json.load(fid)
-        if "decoder" in tokenizer_content:
-            if _is_spm_decoder(tokenizer_content["decoder"]):
-                detokenizer_class = SPMStreamingDetokenizer
-            elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
-                detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
-            elif _is_bpe_decoder(tokenizer_content["decoder"]):
-                detokenizer_class = BPEStreamingDetokenizer
+    # Handle both direct file path and directory path
+    if str(tokenizer_path).endswith('.json'):
+        tokenizer_file = tokenizer_path
+    else:
+        tokenizer_file = tokenizer_path / "tokenizer.json"
+    
+    # Load tokenizer content to infer detokenizer type
+    with open(tokenizer_file, "r") as fid:
+        tokenizer_content = json.load(fid)
+    
+    if "decoder" in tokenizer_content:
+        if _is_spm_decoder(tokenizer_content["decoder"]):
+            detokenizer_class = SPMStreamingDetokenizer
+        elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
+            detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
+        elif _is_bpe_decoder(tokenizer_content["decoder"]):
+            detokenizer_class = BPEStreamingDetokenizer
 
     return TokenizerWrapper(
-        AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra),
+        Tokenizer.from_file(str(tokenizer_file)),
         detokenizer_class,
     )
