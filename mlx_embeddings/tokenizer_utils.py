@@ -1,7 +1,8 @@
 import json
 from functools import partial
 
-from transformers import AutoTokenizer
+import mlx.core as mx
+from tokenizers import Tokenizer
 
 REPLACEMENT_CHAR = "\ufffd"
 
@@ -239,10 +240,10 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
 
 
 class TokenizerWrapper:
-    """A wrapper that combines an HF tokenizer and a detokenizer.
+    """A wrapper that combines a tokenizer and a detokenizer with transformers-compatible API.
 
-    Accessing any attribute other than the ``detokenizer`` is forwarded to the
-    huggingface tokenizer.
+    Provides transformers-compatible methods like encode() with return_tensors support
+    while using the tokenizers library under the hood.
     """
 
     def __init__(self, tokenizer, detokenizer_class=NaiveStreamingDetokenizer):
@@ -254,6 +255,109 @@ class TokenizerWrapper:
             return self._detokenizer
         else:
             return getattr(self._tokenizer, attr)
+
+    def _convert_to_tensors(self, token_ids, return_tensors=None):
+        """Convert token IDs to the requested tensor format."""
+        if return_tensors == "mlx":
+            if isinstance(token_ids, list):
+                return mx.array(token_ids)
+            elif isinstance(token_ids[0], list):  # batch
+                return mx.array(token_ids)
+            return token_ids
+        elif return_tensors is None:
+            return token_ids
+        else:
+            raise ValueError(f"return_tensors='{return_tensors}' not supported. Use 'mlx' or None.")
+
+    def encode(self, text, return_tensors=None, add_special_tokens=True, **kwargs):
+        """Encode text with transformers-compatible API."""
+        token_ids = self._tokenizer.encode(text, add_special_tokens=add_special_tokens).ids
+        # Always add batch dimension for single text
+        if return_tensors == "mlx":
+            return mx.array([token_ids])  # Shape: [1, seq_len]
+        elif return_tensors is None:
+            return token_ids  # Keep as list for compatibility
+        else:
+            raise ValueError(f"return_tensors='{return_tensors}' not supported. Use 'mlx' or None.")
+
+    def batch_encode_plus(self, texts, return_tensors=None, padding=False, truncation=False, 
+                         max_length=None, add_special_tokens=True, **kwargs):
+        """Batch encode texts with transformers-compatible API."""
+        if isinstance(texts, str):
+            texts = [texts]
+        
+        # Encode all texts
+        all_token_ids = []
+        for text in texts:
+            encoding = self._tokenizer.encode(text, add_special_tokens=add_special_tokens)
+            token_ids = encoding.ids
+            
+            # Apply truncation if specified
+            if truncation and max_length and len(token_ids) > max_length:
+                token_ids = token_ids[:max_length]
+            
+            all_token_ids.append(token_ids)
+        
+        # Apply padding if specified
+        if padding:
+            if max_length is None:
+                max_length = max(len(ids) for ids in all_token_ids)
+            
+            pad_token_id = (self._tokenizer.token_to_id('[PAD]') or 
+                            self._tokenizer.token_to_id('<pad>') or 
+                            self._tokenizer.token_to_id('<|endoftext|>') or 0)
+            for i, token_ids in enumerate(all_token_ids):
+                if len(token_ids) < max_length:
+                    all_token_ids[i] = token_ids + [pad_token_id] * (max_length - len(token_ids))
+        
+        # Create attention masks
+        attention_masks = []
+        for token_ids in all_token_ids:
+            mask = [1] * len(token_ids)
+            attention_masks.append(mask)
+        
+        result = {
+            'input_ids': self._convert_to_tensors(all_token_ids, return_tensors),
+            'attention_mask': self._convert_to_tensors(attention_masks, return_tensors)
+        }
+        
+        return result
+
+    def decode(self, token_ids, skip_special_tokens=True, **kwargs):
+        """Decode token IDs to text."""
+        if hasattr(token_ids, 'tolist'):  # MLX array or similar
+            token_ids = token_ids.tolist()
+        return self._tokenizer.decode(token_ids, skip_special_tokens=skip_special_tokens)
+
+    def batch_decode(self, sequences, skip_special_tokens=True, **kwargs):
+        """Batch decode sequences of token IDs."""
+        if hasattr(sequences, 'tolist'):  # MLX array or similar
+            sequences = sequences.tolist()
+        
+        results = []
+        for seq in sequences:
+            results.append(self._tokenizer.decode(seq, skip_special_tokens=skip_special_tokens))
+        return results
+
+    @property
+    def pad_token_id(self):
+        """Get the pad token ID."""
+        return self._tokenizer.token_to_id('[PAD]') or self._tokenizer.token_to_id('<pad>') or 0
+
+    @property
+    def mask_token_id(self):
+        """Get the mask token ID."""
+        return self._tokenizer.token_to_id('[MASK]') or self._tokenizer.token_to_id('<mask>')
+
+    @property
+    def eos_token_id(self):
+        """Get the end-of-sequence token ID."""
+        return self._tokenizer.token_to_id('</s>') or self._tokenizer.token_to_id('<eos>')
+
+    @property
+    def vocab_size(self):
+        """Get the vocabulary size."""
+        return self._tokenizer.get_vocab_size()
 
 
 def _match(a, b):
@@ -303,28 +407,35 @@ def _is_bpe_decoder(decoder):
     return _match(_target_description, decoder)
 
 
-def load_tokenizer(model_path, tokenizer_config_extra={}):
-    """Load a huggingface tokenizer and try to infer the type of streaming
+def load_tokenizer(tokenizer_path, tokenizer_config_extra={}):
+    """Load a tokenizer from a local file path and try to infer the type of streaming
     detokenizer to use.
 
-    Note, to use a fast streaming tokenizer, pass a local file path rather than
-    a Hugging Face repo ID.
+    Args:
+        tokenizer_path: Path to the tokenizer.json file or directory containing it
+        tokenizer_config_extra: Additional config parameters (kept for compatibility)
     """
     detokenizer_class = NaiveStreamingDetokenizer
 
-    tokenizer_file = model_path / "tokenizer.json"
-    if tokenizer_file.exists():
-        with open(tokenizer_file, "r") as fid:
-            tokenizer_content = json.load(fid)
-        if "decoder" in tokenizer_content:
-            if _is_spm_decoder(tokenizer_content["decoder"]):
-                detokenizer_class = SPMStreamingDetokenizer
-            elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
-                detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
-            elif _is_bpe_decoder(tokenizer_content["decoder"]):
-                detokenizer_class = BPEStreamingDetokenizer
+    # Handle both direct file path and directory path
+    if str(tokenizer_path).endswith('.json'):
+        tokenizer_file = tokenizer_path
+    else:
+        tokenizer_file = tokenizer_path / "tokenizer.json"
+    
+    # Load tokenizer content to infer detokenizer type
+    with open(tokenizer_file, "r") as fid:
+        tokenizer_content = json.load(fid)
+    
+    if "decoder" in tokenizer_content:
+        if _is_spm_decoder(tokenizer_content["decoder"]):
+            detokenizer_class = SPMStreamingDetokenizer
+        elif _is_spm_decoder_no_space(tokenizer_content["decoder"]):
+            detokenizer_class = partial(SPMStreamingDetokenizer, trim_space=False)
+        elif _is_bpe_decoder(tokenizer_content["decoder"]):
+            detokenizer_class = BPEStreamingDetokenizer
 
     return TokenizerWrapper(
-        AutoTokenizer.from_pretrained(model_path, **tokenizer_config_extra),
+        Tokenizer.from_file(str(tokenizer_file)),
         detokenizer_class,
     )
